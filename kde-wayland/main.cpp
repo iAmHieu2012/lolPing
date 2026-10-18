@@ -78,6 +78,8 @@
 
 #include <fcntl.h>
 #include <linux/input.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -368,9 +370,6 @@ namespace
     std::map<QString, QPixmap> textures;
     std::map<QString, QPixmap> sepiaTextures;
     std::map<QString, QPixmap> emoteIcons;
-    std::map<QString, std::vector<std::unique_ptr<QSoundEffect>>> wavPool;
-    std::vector<std::pair<std::unique_ptr<QMediaPlayer>, std::unique_ptr<QAudioOutput>>> oggPool;
-    size_t oggIdx = 0;
 
     explicit AssetStore(const QString &rootDir) : assetsDir(rootDir)
     {
@@ -392,25 +391,6 @@ namespace
         QPixmap px(emoteDir.filePath(file));
         if (!px.isNull())
           emoteIcons[key] = px;
-      }
-      QDir sndDir(assetsDir + "/sounds");
-      for (const QString &file : sndDir.entryList({"*.wav"}, QDir::Files))
-      {
-        QString key = QFileInfo(file).completeBaseName();
-        auto &vec = wavPool[key];
-        for (int i = 0; i < 3; ++i)
-        {
-          auto sfx = std::make_unique<QSoundEffect>();
-          sfx->setSource(QUrl::fromLocalFile(sndDir.filePath(file)));
-          vec.push_back(std::move(sfx));
-        }
-      }
-      for (int i = 0; i < 4; ++i)
-      {
-        auto player = std::make_unique<QMediaPlayer>();
-        auto audio = std::make_unique<QAudioOutput>();
-        player->setAudioOutput(audio.get());
-        oggPool.emplace_back(std::move(player), std::move(audio));
       }
     }
 
@@ -435,41 +415,23 @@ namespace
       return texture("generic_ping", false);
     }
 
+    void playAudioFile(const QString &path, int volumePercent)
+    {
+      if (volumePercent <= 0 || !QFileInfo::exists(path))
+        return;
+      double vol = std::clamp(volumePercent / 100.0, 0.0, 1.0);
+      QString volArg = QString("--volume=%1").arg(vol, 0, 'f', 2);
+      QProcess::startDetached("pw-play", {volArg, path});
+    }
+
     void playWav(const QString &name, int volumePercent)
     {
-      if (volumePercent <= 0)
-        return;
-      auto it = wavPool.find(name);
-      if (it == wavPool.end() || it->second.empty())
-        return;
-      float vol = std::clamp(volumePercent / 100.0f, 0.0f, 1.0f);
-      for (auto &sfx : it->second)
-      {
-        if (!sfx->isPlaying())
-        {
-          sfx->setVolume(vol);
-          sfx->play();
-          return;
-        }
-      }
-      auto &sfx = it->second[0];
-      sfx->setVolume(vol);
-      sfx->play();
+      playAudioFile(assetsDir + "/sounds/" + name + ".wav", volumePercent);
     }
 
     void playEmoteOgg(const QString &slug, int volumePercent)
     {
-      if (volumePercent <= 0 || oggPool.empty())
-        return;
-      QString path = assetsDir + "/emotes/" + slug + ".ogg";
-      if (!QFileInfo::exists(path))
-        return;
-      auto &[player, audio] = oggPool[oggIdx % oggPool.size()];
-      ++oggIdx;
-      audio->setVolume(std::clamp(volumePercent / 100.0f, 0.0f, 1.0f));
-      player->stop();
-      player->setSource(QUrl::fromLocalFile(path));
-      player->play();
+      playAudioFile(assetsDir + "/emotes/" + slug + ".ogg", volumePercent);
     }
   };
 
@@ -1781,7 +1743,35 @@ namespace
 
 int main(int argc, char *argv[])
 {
+  XInitThreads();
   qputenv("QT_QPA_PLATFORM", "wayland");
+
+  const char *sockPath = "/tmp/lolping-kde-ipc.sock";
+  {
+    int clientFd = ::socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (clientFd >= 0)
+    {
+      sockaddr_un addr{};
+      addr.sun_family = AF_UNIX;
+      std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", sockPath);
+      if (::sendto(clientFd, "SHOW", 4, 0, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) >= 0)
+      {
+        ::close(clientFd);
+        return 0;
+      }
+      ::close(clientFd);
+    }
+  }
+
+  int ipcFd = ::socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+  if (ipcFd >= 0)
+  {
+    ::unlink(sockPath);
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", sockPath);
+    ::bind(ipcFd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
+  }
 
   QSurfaceFormat fmt;
   fmt.setAlphaBufferSize(8);
@@ -1805,6 +1795,20 @@ int main(int argc, char *argv[])
 
   GlobalKeyWatcher watcher(overlay, settings);
   SettingsDialog settingsDlg(settings, overlay);
+
+  std::unique_ptr<QSocketNotifier> ipcNotifier;
+  if (ipcFd >= 0)
+  {
+    ipcNotifier = std::make_unique<QSocketNotifier>(ipcFd, QSocketNotifier::Read);
+    QObject::connect(ipcNotifier.get(), &QSocketNotifier::activated, [&settingsDlg, ipcFd]()
+                     {
+      char buf[32];
+      while (::recv(ipcFd, buf, sizeof(buf), 0) > 0) {}
+      if (settingsDlg.chkAutostart) settingsDlg.chkAutostart->setChecked(isAutostartEnabled());
+      settingsDlg.show();
+      settingsDlg.raise();
+      settingsDlg.activateWindow(); });
+  }
 
   QSystemTrayIcon tray;
   QIcon trayIcon(assetsPath + "/textures/enemy_missing.png");
@@ -1862,6 +1866,8 @@ int main(int argc, char *argv[])
     if (arg == "--settings")
     {
       settingsDlg.show();
+      settingsDlg.raise();
+      settingsDlg.activateWindow();
     }
     else if (arg == "--demo")
     {
@@ -1871,5 +1877,11 @@ int main(int argc, char *argv[])
   }
 
   overlay.showToast("lolPing Ready", "Hold Alt + Left Drag for Pings | Ctrl + Left Drag for Emotes");
-  return app.exec();
+  int ret = app.exec();
+  if (ipcFd >= 0)
+  {
+    ::close(ipcFd);
+    ::unlink(sockPath);
+  }
+  return ret;
 }

@@ -23,14 +23,23 @@ cat > "$APP_DIR/lolping-kde.desktop" <<EOF
 Type=Application
 Name=lolPing KDE Wayland
 Comment=League of Legends Ping & Emote Wheel for KDE Plasma Wayland
-Exec="$BIN_DIR/lolping-kde"
+Exec="$BIN_DIR/lolping-kde" --settings
 Icon=lolping-kde
 Terminal=false
 Categories=Utility;Game;
 EOF
 
-cp "$APP_DIR/lolping-kde.desktop" "$AUTOSTART_DIR/lolping-kde.desktop"
-echo "X-KDE-autostart-after=panel" >> "$AUTOSTART_DIR/lolping-kde.desktop"
+cat > "$AUTOSTART_DIR/lolping-kde.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=lolPing KDE Wayland
+Comment=League of Legends Ping & Emote Wheel for KDE Plasma Wayland
+Exec="$BIN_DIR/lolping-kde"
+Icon=lolping-kde
+Terminal=false
+Categories=Utility;Game;
+X-KDE-autostart-after=panel
+EOF
 
 echo "Installed to $BIN_DIR/lolping-kde"
 echo "Assets copied to $SHARE_DIR/assets"
